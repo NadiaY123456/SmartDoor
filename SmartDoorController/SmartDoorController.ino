@@ -11,6 +11,7 @@
 // JRD-4035 UART wiring:
 //   Reader TX      -> GPIO 16 (ESP32 RX)
 //   Reader RX      -> GPIO 17 (ESP32 TX)
+
 //   Reader GND     -> common GND
 //   Power the reader with the voltage required by its particular board.
 //
@@ -41,7 +42,7 @@
 
 const uint16_t TOF_TRIGGER_DISTANCE_MM = 250;  // 250 mm = 25 cm.
 const uint32_t CONDITIONS_CLEAR_DELAY_MS = 20000;
-const uint32_t ACTUATOR_TRAVEL_TIME_MS = 1500;
+const uint32_t ACTUATOR_TRAVEL_TIME_MS = 3500;
 
 // Copy arduino_secrets.h.example to arduino_secrets.h and enter the 2.4 GHz
 // Wi-Fi credentials there. That local file is ignored by Git.
@@ -49,14 +50,18 @@ const uint32_t ACTUATOR_TRAVEL_TIME_MS = 1500;
 #include "arduino_secrets.h"
 const char *WIFI_SSID = SMARTDOOR_WIFI_SSID;
 const char *WIFI_PASSWORD = SMARTDOOR_WIFI_PASSWORD;
+#elif __has_include("arduino_secrets.h/arduino_secrets.h.ino")
+// Support the credentials file currently stored in its Arduino-created folder.
+#include "arduino_secrets.h/arduino_secrets.h.ino"
+const char *WIFI_SSID = SMARTDOOR_WIFI_SSID;
+const char *WIFI_PASSWORD = SMARTDOOR_WIFI_PASSWORD;
 #else
 const char *WIFI_SSID = "YOUR_WIFI_NAME";
 const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 #endif
 
-// POSIX time-zone rule. This default is US Central Time with daylight saving.
-// Change it if the door is installed in another time zone.
-const char *TIME_ZONE = "CST6CDT,M3.2.0,M11.1.0";
+// POSIX time-zone rule. Operating in PST / PDT, automatically changes
+const char *TIME_ZONE = "PST8PDT,M3.2.0,M11.1.0";
 const char *NTP_SERVER_1 = "pool.ntp.org";
 const char *NTP_SERVER_2 = "time.nist.gov";
 
@@ -67,17 +72,26 @@ const uint32_t RFID_PRESENCE_HOLD_MS = 1000;
 const uint32_t SERIAL_REPORT_PERIOD_MS = 500;
 const uint32_t TOF_MEASUREMENT_PERIOD_MS = 100;
 const uint32_t TOF_STALE_AFTER_MS = 600;
-const uint32_t RFID_POLL_PERIOD_MS = 250;
+const uint32_t RFID_RESPONSE_WINDOW_MS = 350;
+const uint32_t RFID_POLL_INTERVAL_MS = 500;
 const uint32_t MOTOR_DIRECTION_CHANGE_DELAY_MS = 100;
 const uint32_t WIFI_RETRY_PERIOD_MS = 10000;
 const uint32_t SCHEDULE_CHECK_PERIOD_MS = 1000;
 
+// PWM slows the unloaded actuators without adding an audible low-frequency
+// whine. Raise MOTOR_RUN_DUTY if a door later needs more torque.
+const uint32_t MOTOR_PWM_FREQUENCY_HZ = 20000;
+const uint8_t MOTOR_PWM_RESOLUTION_BITS = 8;
+const uint8_t MOTOR_START_DUTY = 90;
+const uint8_t MOTOR_RUN_DUTY = 140;
+const uint32_t MOTOR_RAMP_TIME_MS = 300;
+
 // Set a motor's value to false if that actuator moves opposite to the label
 // printed by the program. Alternatively, swap that driver's OUT1/OUT2 wires.
-const bool OUTSIDE_LEFT_EXTEND_IS_IN1_HIGH = true;
-const bool OUTSIDE_RIGHT_EXTEND_IS_IN1_HIGH = true;
-const bool INSIDE_LEFT_EXTEND_IS_IN1_HIGH = true;
-const bool INSIDE_RIGHT_EXTEND_IS_IN1_HIGH = true;
+const bool OUTSIDE_LEFT_EXTEND_IS_IN1_HIGH = false;
+const bool OUTSIDE_RIGHT_EXTEND_IS_IN1_HIGH = false;
+const bool INSIDE_LEFT_EXTEND_IS_IN1_HIGH = false;
+const bool INSIDE_RIGHT_EXTEND_IS_IN1_HIGH = false;
 
 // ------------------------------- Pin layout --------------------------------
 
@@ -227,12 +241,22 @@ const uint8_t SINGLE_POLL_COMMAND[] = {
   0xBB, 0x00, 0x22, 0x00, 0x00, 0x22, 0x7E
 };
 
-const size_t MAX_RFID_FRAME_LENGTH = 135;
 const size_t MAX_EPC_LENGTH = 128;
 
-uint8_t rfidFrame[MAX_RFID_FRAME_LENGTH];
-size_t rfidFrameLength = 0;
-size_t expectedRfidFrameLength = 0;
+struct RfidFrame {
+  uint8_t type;
+  uint8_t command;
+  uint16_t payloadLength;
+  uint8_t payload[MAX_EPC_LENGTH];
+  uint8_t checksum;
+};
+
+struct TagReading {
+  bool valid;
+  int8_t rssiDbm;
+  size_t epcLength;
+  uint8_t epc[MAX_EPC_LENGTH];
+};
 
 bool rfidHasResponded = false;
 bool rfidHasSeenTag = false;
@@ -243,91 +267,131 @@ int8_t lastTagRssiDbm = 0;
 uint8_t lastTagEpc[MAX_EPC_LENGTH];
 size_t lastTagEpcLength = 0;
 
-void resetRfidParser() {
-  rfidFrameLength = 0;
-  expectedRfidFrameLength = 0;
+// Prevent Arduino's prototype generator from placing these declarations before
+// the RFID frame types above.
+bool readRfidByteBefore(uint8_t &value, uint32_t deadlineMs);
+bool readRfidFrame(RfidFrame &frame, uint32_t timeoutMs);
+bool frameContainsTag(const RfidFrame &frame, TagReading &tag);
+void pollRfidOnce();
+void updateRfid(uint32_t nowMs);
+
+bool readRfidByteBefore(uint8_t &value, uint32_t deadlineMs) {
+  while ((int32_t)(deadlineMs - millis()) > 0) {
+    if (rfidUart.available() > 0) {
+      value = (uint8_t)rfidUart.read();
+      return true;
+    }
+    delay(1);
+  }
+  return false;
 }
 
-void processCompleteRfidFrame(uint32_t nowMs) {
-  if (rfidFrameLength < 7 || rfidFrame[rfidFrameLength - 1] != 0x7E) {
-    return;
+bool readRfidFrame(RfidFrame &frame, uint32_t timeoutMs) {
+  const uint32_t deadlineMs = millis() + timeoutMs;
+  uint8_t value = 0;
+
+  do {
+    if (!readRfidByteBefore(value, deadlineMs)) {
+      return false;
+    }
+  } while (value != 0xBB);
+
+  uint8_t lengthMsb = 0;
+  uint8_t lengthLsb = 0;
+  if (!readRfidByteBefore(frame.type, deadlineMs) ||
+      !readRfidByteBefore(frame.command, deadlineMs) ||
+      !readRfidByteBefore(lengthMsb, deadlineMs) ||
+      !readRfidByteBefore(lengthLsb, deadlineMs)) {
+    return false;
   }
 
-  uint8_t checksum = 0;
-  for (size_t index = 1; index < rfidFrameLength - 2; ++index) {
-    checksum += rfidFrame[index];
-  }
-  if (checksum != rfidFrame[rfidFrameLength - 2]) {
-    return;
+  frame.payloadLength = ((uint16_t)lengthMsb << 8) | lengthLsb;
+  if (frame.payloadLength > MAX_EPC_LENGTH) {
+    return false;
   }
 
-  rfidHasResponded = true;
-  lastRfidResponseMs = nowMs;
+  uint8_t calculatedChecksum = frame.type + frame.command + lengthMsb + lengthLsb;
+  for (size_t index = 0; index < frame.payloadLength; ++index) {
+    if (!readRfidByteBefore(frame.payload[index], deadlineMs)) {
+      return false;
+    }
+    calculatedChecksum += frame.payload[index];
+  }
 
-  const uint8_t type = rfidFrame[1];
-  const uint8_t command = rfidFrame[2];
-  const uint16_t payloadLength =
-    ((uint16_t)rfidFrame[3] << 8) | rfidFrame[4];
+  uint8_t frameEnd = 0;
+  if (!readRfidByteBefore(frame.checksum, deadlineMs) ||
+      !readRfidByteBefore(frameEnd, deadlineMs)) {
+    return false;
+  }
 
+  return frameEnd == 0x7E && frame.checksum == calculatedChecksum;
+}
+
+bool frameContainsTag(const RfidFrame &frame, TagReading &tag) {
   // Tag payload: RSSI (1), PC (2), EPC (variable), CRC (2).
-  if (type == 0x02 && command == 0x22 && payloadLength >= 5) {
-    size_t epcLength = payloadLength - 5;
-    if (epcLength > MAX_EPC_LENGTH) {
-      epcLength = MAX_EPC_LENGTH;
+  if (frame.type != 0x02 || frame.command != 0x22 ||
+      frame.payloadLength < 5) {
+    return false;
+  }
+
+  tag.valid = true;
+  tag.rssiDbm = (int8_t)frame.payload[0];
+  tag.epcLength = frame.payloadLength - 5;
+  for (size_t index = 0; index < tag.epcLength; ++index) {
+    tag.epc[index] = frame.payload[index + 3];
+  }
+  return true;
+}
+
+void pollRfidOnce() {
+  // Match the standalone test: discard stale bytes before each new command.
+  while (rfidUart.available() > 0) {
+    rfidUart.read();
+  }
+
+  rfidUart.write(SINGLE_POLL_COMMAND, sizeof(SINGLE_POLL_COMMAND));
+  rfidUart.flush();
+
+  const uint32_t responseDeadlineMs = millis() + RFID_RESPONSE_WINDOW_MS;
+  bool receivedValidFrame = false;
+  TagReading firstTag = {false, 0, 0, {0}};
+
+  while ((int32_t)(responseDeadlineMs - millis()) > 0) {
+    RfidFrame frame;
+    const uint32_t timeRemainingMs = responseDeadlineMs - millis();
+    if (!readRfidFrame(frame, timeRemainingMs)) {
+      break;
     }
 
-    lastTagRssiDbm = (int8_t)rfidFrame[5];
-    lastTagEpcLength = epcLength;
-    for (size_t index = 0; index < epcLength; ++index) {
-      lastTagEpc[index] = rfidFrame[8 + index];
+    receivedValidFrame = true;
+    if (!firstTag.valid) {
+      frameContainsTag(frame, firstTag);
+    }
+  }
+
+  const uint32_t nowMs = millis();
+  if (receivedValidFrame) {
+    rfidHasResponded = true;
+    lastRfidResponseMs = nowMs;
+  }
+  if (firstTag.valid) {
+    lastTagRssiDbm = firstTag.rssiDbm;
+    lastTagEpcLength = firstTag.epcLength;
+    for (size_t index = 0; index < firstTag.epcLength; ++index) {
+      lastTagEpc[index] = firstTag.epc[index];
     }
     rfidHasSeenTag = true;
     lastTagSeenMs = nowMs;
   }
 }
 
-void consumeRfidByte(uint8_t value, uint32_t nowMs) {
-  if (rfidFrameLength == 0) {
-    if (value != 0xBB) {
-      return;
-    }
-    rfidFrame[rfidFrameLength++] = value;
-    return;
-  }
-
-  if (rfidFrameLength >= MAX_RFID_FRAME_LENGTH) {
-    resetRfidParser();
-    return;
-  }
-
-  rfidFrame[rfidFrameLength++] = value;
-
-  if (rfidFrameLength == 5) {
-    const uint16_t payloadLength =
-      ((uint16_t)rfidFrame[3] << 8) | rfidFrame[4];
-    expectedRfidFrameLength = (size_t)payloadLength + 7;
-    if (expectedRfidFrameLength > MAX_RFID_FRAME_LENGTH) {
-      resetRfidParser();
-      return;
-    }
-  }
-
-  if (expectedRfidFrameLength > 0 &&
-      rfidFrameLength == expectedRfidFrameLength) {
-    processCompleteRfidFrame(nowMs);
-    resetRfidParser();
-  }
-}
-
 void updateRfid(uint32_t nowMs) {
-  while (rfidUart.available() > 0) {
-    consumeRfidByte((uint8_t)rfidUart.read(), nowMs);
+  if (nowMs - lastRfidPollMs < RFID_POLL_INTERVAL_MS) {
+    return;
   }
-
-  if (nowMs - lastRfidPollMs >= RFID_POLL_PERIOD_MS) {
-    lastRfidPollMs = nowMs;
-    rfidUart.write(SINGLE_POLL_COMMAND, sizeof(SINGLE_POLL_COMMAND));
-  }
+  pollRfidOnce();
+  // Wait the full interval after the response window, like RfidUartTest.ino.
+  lastRfidPollMs = millis();
 }
 
 bool rfidTagIsPresent(uint32_t nowMs) {
@@ -362,13 +426,17 @@ struct MotorPair {
   PairState state;
   uint32_t stateStartedMs;
   uint32_t clearStartedMs;
+  bool commandedExtend;
+  bool openingClaimed;
 };
 
 // Explicit declarations keep Arduino's automatic prototype generator from
 // placing these functions before the custom motor types above.
 void initializeMotor(const Motor &motor);
 void stopMotor(const Motor &motor);
-void driveMotor(const Motor &motor, bool extend);
+void driveMotor(const Motor &motor, bool extend, uint8_t duty);
+void drivePair(MotorPair &pair, uint8_t duty);
+uint8_t motorDutyAt(const MotorPair &pair, uint32_t nowMs);
 void stopPair(MotorPair &pair);
 void startExtending(MotorPair &pair, uint32_t nowMs);
 void startRetracting(MotorPair &pair, uint32_t nowMs);
@@ -380,28 +448,45 @@ void printMotorPair(const char *location, const MotorPair &pair,
                     uint32_t nowMs);
 
 MotorPair outsidePair = {
-  &outsideLeftMotor, &outsideRightMotor, PAIR_EXTENDING, 0, 0
+  &outsideRightMotor, &insideLeftMotor, PAIR_EXTENDING, 0, 0, true, false
 };
 MotorPair insidePair = {
-  &insideLeftMotor, &insideRightMotor, PAIR_EXTENDING, 0, 0
+  &outsideLeftMotor, &insideRightMotor, PAIR_EXTENDING, 0, 0, true, false
 };
 
 void initializeMotor(const Motor &motor) {
-  pinMode(motor.in1Pin, OUTPUT);
-  pinMode(motor.in2Pin, OUTPUT);
-  digitalWrite(motor.in1Pin, LOW);
-  digitalWrite(motor.in2Pin, LOW);
+  ledcAttach(motor.in1Pin, MOTOR_PWM_FREQUENCY_HZ,
+             MOTOR_PWM_RESOLUTION_BITS);
+  ledcAttach(motor.in2Pin, MOTOR_PWM_FREQUENCY_HZ,
+             MOTOR_PWM_RESOLUTION_BITS);
+  ledcWrite(motor.in1Pin, 0);
+  ledcWrite(motor.in2Pin, 0);
 }
 
 void stopMotor(const Motor &motor) {
-  digitalWrite(motor.in1Pin, LOW);
-  digitalWrite(motor.in2Pin, LOW);
+  ledcWrite(motor.in1Pin, 0);
+  ledcWrite(motor.in2Pin, 0);
 }
 
-void driveMotor(const Motor &motor, bool extend) {
+void driveMotor(const Motor &motor, bool extend, uint8_t duty) {
   const bool in1High = extend == motor.extendIsIn1High;
-  digitalWrite(motor.in1Pin, in1High ? HIGH : LOW);
-  digitalWrite(motor.in2Pin, in1High ? LOW : HIGH);
+  ledcWrite(motor.in1Pin, in1High ? duty : 0);
+  ledcWrite(motor.in2Pin, in1High ? 0 : duty);
+}
+
+void drivePair(MotorPair &pair, uint8_t duty) {
+  driveMotor(*pair.left, pair.commandedExtend, duty);
+  driveMotor(*pair.right, pair.commandedExtend, duty);
+}
+
+uint8_t motorDutyAt(const MotorPair &pair, uint32_t nowMs) {
+  const uint32_t elapsedMs = nowMs - pair.stateStartedMs;
+  if (elapsedMs >= MOTOR_RAMP_TIME_MS) {
+    return MOTOR_RUN_DUTY;
+  }
+  return MOTOR_START_DUTY +
+         ((uint32_t)(MOTOR_RUN_DUTY - MOTOR_START_DUTY) * elapsedMs) /
+             MOTOR_RAMP_TIME_MS;
 }
 
 void stopPair(MotorPair &pair) {
@@ -410,24 +495,28 @@ void stopPair(MotorPair &pair) {
 }
 
 void startExtending(MotorPair &pair, uint32_t nowMs) {
-  driveMotor(*pair.left, true);
-  driveMotor(*pair.right, true);
+  pair.commandedExtend = true;
+  pair.openingClaimed = false;
   pair.state = PAIR_EXTENDING;
   pair.stateStartedMs = nowMs;
+  drivePair(pair, MOTOR_START_DUTY);
 }
 
 void startRetracting(MotorPair &pair, uint32_t nowMs) {
-  driveMotor(*pair.left, false);
-  driveMotor(*pair.right, false);
+  pair.commandedExtend = false;
+  pair.openingClaimed = true;
   pair.state = PAIR_RETRACTING;
   pair.stateStartedMs = nowMs;
+  drivePair(pair, MOTOR_START_DUTY);
 }
 
 void updateMotorPair(MotorPair &pair, bool retractCondition,
                      bool immediateExtend, uint32_t nowMs) {
   switch (pair.state) {
     case PAIR_EXTENDING:
+      drivePair(pair, motorDutyAt(pair, nowMs));
       if (retractCondition) {
+        pair.openingClaimed = true;
         stopPair(pair);
         pair.state = PAIR_REVERSAL_PAUSE;
         pair.stateStartedMs = nowMs;
@@ -445,6 +534,7 @@ void updateMotorPair(MotorPair &pair, bool retractCondition,
       break;
 
     case PAIR_RETRACTING:
+      drivePair(pair, motorDutyAt(pair, nowMs));
       if (immediateExtend) {
         stopPair(pair);
         pair.state = PAIR_REVERSAL_PAUSE;
@@ -1072,9 +1162,12 @@ void updateWifi(uint32_t nowMs) {
       servicesStarted = true;
       if (MDNS.begin("smartdoor")) {
         MDNS.addService("http", "tcp", 80);
+        Serial.println("WEB: mDNS ready at http://smartdoor.local/");
+      } else {
+        Serial.println("WEB: mDNS failed; use the IP address below instead.");
       }
       configTzTime(TIME_ZONE, NTP_SERVER_1, NTP_SERVER_2);
-      Serial.printf("WEB: connected to %s. Open http://smartdoor.local/ or http://%s/\n",
+      Serial.printf("WEB: connected to %s. Direct dashboard URL: http://%s/\n",
                     WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
     }
     webServer.handleClient();
@@ -1084,6 +1177,7 @@ void updateWifi(uint32_t nowMs) {
   servicesStarted = false;
   if (nowMs - lastAttemptMs >= WIFI_RETRY_PERIOD_MS) {
     lastAttemptMs = nowMs;
+    Serial.printf("WEB: Wi-Fi status %d; retrying connection...\n", WiFi.status());
     WiFi.disconnect();
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     Serial.println("WEB: attempting Wi-Fi connection...");
@@ -1165,10 +1259,15 @@ void loop() {
   const bool insideNear = tofIsNear(insideTof);
   const bool outsideNear = tofIsNear(outsideTof);
 
-  // A cat on the inside opens the outside locks to permit outward travel.
-  const bool automaticOutboundCondition = tagPresent && insideNear;
-  // A cat on the outside opens the inside locks to permit inward travel.
-  const bool automaticInboundCondition = tagPresent && outsideNear;
+  // The outside ToF sensor opens the outside motor pair. Only one side may
+  // open automatically at a time; outside has priority if both detect first.
+  bool automaticOutboundCondition = tagPresent && outsideNear;
+  bool automaticInboundCondition = tagPresent && insideNear;
+  if (outsidePair.openingClaimed || automaticOutboundCondition) {
+    automaticInboundCondition = false;
+  } else if (insidePair.openingClaimed || automaticInboundCondition) {
+    automaticOutboundCondition = false;
+  }
 
   bool outsideRetractDemand = false;
   bool insideRetractDemand = false;
