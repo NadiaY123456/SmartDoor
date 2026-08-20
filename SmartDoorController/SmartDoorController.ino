@@ -101,6 +101,30 @@ enum OperationMode {
   MODE_FORCE_LOCKED
 };
 
+enum DoorOpeningDirection : uint8_t {
+  OPENING_OUTBOUND,
+  OPENING_INBOUND,
+  OPENING_BOTH_AUTOMATIC,
+  OPENING_FORCED_BOTH
+};
+
+const uint32_t DOOR_LOG_MAGIC = 0x53444C47;  // "SDLG"
+const size_t MAX_DOOR_LOG_EVENTS = 50;
+
+struct DoorLogEvent {
+  int64_t epochSeconds;
+  uint32_t uptimeSeconds;
+  uint8_t direction;
+  uint8_t reserved[3];
+};
+
+struct DoorLogStorage {
+  uint32_t magic;
+  uint16_t count;
+  uint16_t nextIndex;
+  DoorLogEvent events[MAX_DOOR_LOG_EVENTS];
+};
+
 OperationMode activeMode = MODE_AUTOMATIC;
 OperationMode pendingMode = MODE_AUTOMATIC;
 bool modeChangePending = false;
@@ -109,6 +133,8 @@ bool scheduleEnabled = false;
 uint16_t scheduledOpenMinute = 8 * 60;
 uint16_t scheduledLockMinute = 22 * 60;
 int8_t lastScheduleTarget = -1;
+
+DoorLogStorage doorLog = {DOOR_LOG_MAGIC, 0, 0, {}};
 
 WebServer webServer(80);
 Preferences preferences;
@@ -714,6 +740,76 @@ void updateDailySchedule(uint32_t nowMs) {
   }
 }
 
+// ----------------------------- Opening history ------------------------------
+
+const char *doorDirectionName(DoorOpeningDirection direction) {
+  switch (direction) {
+    case OPENING_OUTBOUND: return "Cat going out";
+    case OPENING_INBOUND: return "Cat coming in";
+    case OPENING_BOTH_AUTOMATIC: return "Both directions detected";
+    case OPENING_FORCED_BOTH: return "Forced open - both directions";
+  }
+  return "Unknown direction";
+}
+
+void loadDoorHistory() {
+  if (preferences.getBytesLength("doorLog") != sizeof(doorLog)) {
+    return;
+  }
+
+  DoorLogStorage storedLog;
+  preferences.getBytes("doorLog", &storedLog, sizeof(storedLog));
+  if (storedLog.magic != DOOR_LOG_MAGIC ||
+      storedLog.count > MAX_DOOR_LOG_EVENTS ||
+      storedLog.nextIndex >= MAX_DOOR_LOG_EVENTS) {
+    Serial.println("LOG: stored opening history was invalid and was ignored.");
+    return;
+  }
+  doorLog = storedLog;
+  Serial.printf("LOG: restored %u door-opening event(s).\n", doorLog.count);
+}
+
+void recordDoorOpening(DoorOpeningDirection direction, uint32_t nowMs) {
+  DoorLogEvent &event = doorLog.events[doorLog.nextIndex];
+  const time_t currentTime = time(nullptr);
+  event.epochSeconds = currentTime >= 1609459200 ? (int64_t)currentTime : 0;
+  event.uptimeSeconds = nowMs / 1000;
+  event.direction = (uint8_t)direction;
+  memset(event.reserved, 0, sizeof(event.reserved));
+
+  doorLog.nextIndex = (doorLog.nextIndex + 1) % MAX_DOOR_LOG_EVENTS;
+  if (doorLog.count < MAX_DOOR_LOG_EVENTS) {
+    ++doorLog.count;
+  }
+  preferences.putBytes("doorLog", &doorLog, sizeof(doorLog));
+
+  Serial.printf("DOOR LOG: opened - %s", doorDirectionName(direction));
+  if (event.epochSeconds == 0) {
+    Serial.printf(" | clock not synchronized | uptime %lu s\n",
+                  event.uptimeSeconds);
+  } else {
+    time_t eventTime = (time_t)event.epochSeconds;
+    struct tm timeInfo;
+    localtime_r(&eventTime, &timeInfo);
+    char timeText[32];
+    strftime(timeText, sizeof(timeText), "%Y-%m-%d %H:%M:%S", &timeInfo);
+    Serial.printf(" | %s\n", timeText);
+  }
+}
+
+String doorEventTimeText(const DoorLogEvent &event) {
+  if (event.epochSeconds == 0) {
+    return "Clock not synced (uptime " + String(event.uptimeSeconds) + " s)";
+  }
+
+  time_t eventTime = (time_t)event.epochSeconds;
+  struct tm timeInfo;
+  localtime_r(&eventTime, &timeInfo);
+  char timeText[40];
+  strftime(timeText, sizeof(timeText), "%a %Y-%m-%d %H:%M:%S", &timeInfo);
+  return String(timeText);
+}
+
 // ------------------------------- Web control --------------------------------
 
 const char CONTROL_PAGE[] PROGMEM = R"HTML(
@@ -725,7 +821,7 @@ const char CONTROL_PAGE[] PROGMEM = R"HTML(
   <title>Smart Cat Door</title>
   <style>
     :root{color-scheme:dark;--bg:#10151b;--card:#1a222c;--line:#314050;--text:#edf3f7;--muted:#9cb0c0;--green:#37c978;--red:#ff6670;--amber:#f4bd50;--blue:#55a8ff}
-    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px system-ui,sans-serif}main{width:min(980px,94vw);margin:28px auto 60px}h1{font-size:clamp(1.8rem,5vw,2.7rem);margin:0 0 5px}h2{font-size:1.05rem;margin:0 0 14px}.subtitle,.note{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;margin-top:18px}.card{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:18px}.wide{grid-column:1/-1}.value{font-size:1.25rem;font-weight:750}.row{display:flex;justify-content:space-between;gap:14px;padding:7px 0;border-bottom:1px solid #26313d}.row:last-child{border:0}.ok{color:var(--green)}.warn{color:var(--amber)}.bad{color:var(--red)}button{border:0;border-radius:10px;padding:12px 15px;margin:4px 5px 4px 0;font-weight:750;cursor:pointer;color:#071017}.auto{background:var(--blue)}.open{background:var(--green)}.lock{background:var(--red)}.save{background:var(--amber)}input[type=time]{background:#111820;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px;font:inherit;margin:5px 12px 5px 5px}.pending{border-color:var(--amber)}#message{min-height:24px;color:var(--amber);margin-top:10px}.small{font-size:.88rem}.pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:5px 10px;margin:3px 4px 3px 0}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px system-ui,sans-serif}main{width:min(980px,94vw);margin:28px auto 60px}h1{font-size:clamp(1.8rem,5vw,2.7rem);margin:0 0 5px}h2{font-size:1.05rem;margin:0 0 14px}.subtitle,.note{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;margin-top:18px}.card{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:18px}.wide{grid-column:1/-1}.value{font-size:1.25rem;font-weight:750}.row{display:flex;justify-content:space-between;gap:14px;padding:7px 0;border-bottom:1px solid #26313d}.row:last-child{border:0}.ok{color:var(--green)}.warn{color:var(--amber)}.bad{color:var(--red)}button{border:0;border-radius:10px;padding:12px 15px;margin:4px 5px 4px 0;font-weight:750;cursor:pointer;color:#071017}.auto{background:var(--blue)}.open{background:var(--green)}.lock{background:var(--red)}.save{background:var(--amber)}input[type=time]{background:#111820;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px;font:inherit;margin:5px 12px 5px 5px}.pending{border-color:var(--amber)}#message{min-height:24px;color:var(--amber);margin-top:10px}.small{font-size:.88rem}.event{display:grid;grid-template-columns:minmax(145px,1fr) minmax(130px,1fr);gap:16px;padding:10px 0;border-bottom:1px solid #26313d}.event:last-child{border:0}.eventTime{color:var(--muted)}
   </style>
 </head>
 <body><main>
@@ -769,6 +865,11 @@ const char CONTROL_PAGE[] PROGMEM = R"HTML(
       <div class="note small" style="margin-top:10px">The scheduled change is also held pending by the safety interlock. An overnight interval is supported.</div>
       <div class="row" style="margin-top:12px"><span>ESP32 local time</span><span id="localTime">Waiting for NTP</span></div>
     </section>
+    <section class="card wide">
+      <h2>Opening history</h2>
+      <div class="note small" style="margin-bottom:8px">Most recent 50 completed openings, newest first.</div>
+      <div id="history"><div class="note">No openings logged yet.</div></div>
+    </section>
   </div>
 </main>
 <script>
@@ -790,7 +891,13 @@ async function refresh(){
     if(document.activeElement.tagName!=='INPUT'){$('scheduleEnabled').checked=s.schedule.enabled;$('openTime').value=s.schedule.open;$('lockTime').value=s.schedule.locked}$('localTime').textContent=s.localTime;
   }catch(e){$('stage').textContent='Controller offline'}
 }
-refresh();setInterval(refresh,1000);
+async function refreshHistory(){
+  try{const r=await fetch('/api/history',{cache:'no-store'});const data=await r.json();const box=$('history');box.replaceChildren();
+    if(!data.events.length){const empty=document.createElement('div');empty.className='note';empty.textContent='No openings logged yet.';box.appendChild(empty);return}
+    for(const event of data.events){const row=document.createElement('div');row.className='event';const time=document.createElement('span');time.className='eventTime';time.textContent=event.time;const direction=document.createElement('strong');direction.textContent=event.direction;row.append(time,direction);box.appendChild(row)}
+  }catch(e){}
+}
+refresh();refreshHistory();setInterval(refresh,1000);setInterval(refreshHistory,5000);
 </script></body></html>
 )HTML";
 
@@ -860,6 +967,27 @@ void handleStatusRequest() {
   webServer.send(200, "application/json", json);
 }
 
+void handleHistoryRequest() {
+  String json;
+  json.reserve(6000);
+  json = "{\"events\":[";
+  for (uint16_t offset = 0; offset < doorLog.count; ++offset) {
+    const size_t index =
+      (doorLog.nextIndex + MAX_DOOR_LOG_EVENTS - 1 - offset) %
+      MAX_DOOR_LOG_EVENTS;
+    const DoorLogEvent &event = doorLog.events[index];
+    if (offset > 0) {
+      json += ',';
+    }
+    json += "{\"time\":\"" + doorEventTimeText(event) +
+            "\",\"direction\":\"" +
+            String(doorDirectionName((DoorOpeningDirection)event.direction)) +
+            "\"}";
+  }
+  json += "]}";
+  webServer.send(200, "application/json", json);
+}
+
 void handleModeRequest() {
   if (!webServer.hasArg("value")) {
     webServer.send(400, "application/json", "{\"message\":\"Missing mode.\"}");
@@ -926,6 +1054,7 @@ void startWebServer() {
     webServer.send_P(200, "text/html", CONTROL_PAGE);
   });
   webServer.on("/api/status", HTTP_GET, handleStatusRequest);
+  webServer.on("/api/history", HTTP_GET, handleHistoryRequest);
   webServer.on("/api/mode", HTTP_POST, handleModeRequest);
   webServer.on("/api/schedule", HTTP_POST, handleScheduleRequest);
   webServer.onNotFound([]() {
@@ -974,6 +1103,7 @@ void setup() {
   scheduledOpenMinute = preferences.getUShort("openMin", 8 * 60);
   scheduledLockMinute = preferences.getUShort("lockMin", 22 * 60);
   const uint8_t savedMode = preferences.getUChar("savedMode", MODE_AUTOMATIC);
+  loadDoorHistory();
   if (savedMode == MODE_FORCE_OPEN || savedMode == MODE_FORCE_LOCKED) {
     pendingMode = (OperationMode)savedMode;
     modeChangePending = true;
@@ -1054,8 +1184,39 @@ void loop() {
     insideRetractDemand = automaticInboundCondition;
   }
 
+  const PairState previousOutsideState = outsidePair.state;
+  const PairState previousInsideState = insidePair.state;
   updateMotorPair(outsidePair, outsideRetractDemand, immediateExtend, nowMs);
   updateMotorPair(insidePair, insideRetractDemand, immediateExtend, nowMs);
+
+  const bool outsideFinishedOpening =
+    previousOutsideState == PAIR_RETRACTING &&
+    (outsidePair.state == PAIR_RETRACTED_ACTIVE ||
+     outsidePair.state == PAIR_RETRACTED_CLEAR_WAIT);
+  const bool insideFinishedOpening =
+    previousInsideState == PAIR_RETRACTING &&
+    (insidePair.state == PAIR_RETRACTED_ACTIVE ||
+     insidePair.state == PAIR_RETRACTED_CLEAR_WAIT);
+
+  static bool forcedOpeningLogged = false;
+  if (activeMode == MODE_FORCE_OPEN) {
+    if ((outsideFinishedOpening || insideFinishedOpening) &&
+        !forcedOpeningLogged) {
+      recordDoorOpening(OPENING_FORCED_BOTH, nowMs);
+      forcedOpeningLogged = true;
+    }
+  } else {
+    forcedOpeningLogged = false;
+    if (activeMode == MODE_AUTOMATIC) {
+      if (outsideFinishedOpening && insideFinishedOpening) {
+        recordDoorOpening(OPENING_BOTH_AUTOMATIC, nowMs);
+      } else if (outsideFinishedOpening) {
+        recordDoorOpening(OPENING_OUTBOUND, nowMs);
+      } else if (insideFinishedOpening) {
+        recordDoorOpening(OPENING_INBOUND, nowMs);
+      }
+    }
+  }
 
   static uint32_t lastReportMs = 0;
   if (nowMs - lastReportMs >= SERIAL_REPORT_PERIOD_MS) {
