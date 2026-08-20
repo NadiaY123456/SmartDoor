@@ -25,17 +25,40 @@
 // Do not power an actuator from the ESP32.
 //
 // Required Arduino library: "VL53L1X" by Pololu.
-// Open Serial Monitor at 115200 baud.
+// Open Serial Monitor at 115200 baud. After entering the Wi-Fi settings below,
+// open http://smartdoor.local/ (or the printed IP address) on the same network.
 
 #include <Arduino.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
+#include <WebServer.h>
+#include <WiFi.h>
 #include <Wire.h>
 #include <VL53L1X.h>
+#include <time.h>
 
 // --------------------------- Adjustable settings ---------------------------
 
-const uint16_t TOF_TRIGGER_DISTANCE_MM = 100;  // 100 mm = 10 cm.
-const uint32_t CONDITIONS_CLEAR_DELAY_MS = 10000;
+const uint16_t TOF_TRIGGER_DISTANCE_MM = 250;  // 250 mm = 25 cm.
+const uint32_t CONDITIONS_CLEAR_DELAY_MS = 20000;
 const uint32_t ACTUATOR_TRAVEL_TIME_MS = 1500;
+
+// Copy arduino_secrets.h.example to arduino_secrets.h and enter the 2.4 GHz
+// Wi-Fi credentials there. That local file is ignored by Git.
+#if __has_include("arduino_secrets.h")
+#include "arduino_secrets.h"
+const char *WIFI_SSID = SMARTDOOR_WIFI_SSID;
+const char *WIFI_PASSWORD = SMARTDOOR_WIFI_PASSWORD;
+#else
+const char *WIFI_SSID = "YOUR_WIFI_NAME";
+const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+#endif
+
+// POSIX time-zone rule. This default is US Central Time with daylight saving.
+// Change it if the door is installed in another time zone.
+const char *TIME_ZONE = "CST6CDT,M3.2.0,M11.1.0";
+const char *NTP_SERVER_1 = "pool.ntp.org";
+const char *NTP_SERVER_2 = "time.nist.gov";
 
 // A valid tag remains "present" briefly between reader polls. Increase this
 // if the reader occasionally misses one poll while the tag is stationary.
@@ -46,6 +69,8 @@ const uint32_t TOF_MEASUREMENT_PERIOD_MS = 100;
 const uint32_t TOF_STALE_AFTER_MS = 600;
 const uint32_t RFID_POLL_PERIOD_MS = 250;
 const uint32_t MOTOR_DIRECTION_CHANGE_DELAY_MS = 100;
+const uint32_t WIFI_RETRY_PERIOD_MS = 10000;
+const uint32_t SCHEDULE_CHECK_PERIOD_MS = 1000;
 
 // Set a motor's value to false if that actuator moves opposite to the label
 // printed by the program. Alternatively, swap that driver's OUT1/OUT2 wires.
@@ -69,6 +94,24 @@ const uint8_t RFID_TX_PIN = 17;
 const uint32_t USB_SERIAL_BAUD = 115200;
 const uint32_t RFID_UART_BAUD = 115200;
 const uint32_t TOF_TIMEOUT_MS = 500;
+
+enum OperationMode {
+  MODE_AUTOMATIC,
+  MODE_FORCE_OPEN,
+  MODE_FORCE_LOCKED
+};
+
+OperationMode activeMode = MODE_AUTOMATIC;
+OperationMode pendingMode = MODE_AUTOMATIC;
+bool modeChangePending = false;
+
+bool scheduleEnabled = false;
+uint16_t scheduledOpenMinute = 8 * 60;
+uint16_t scheduledLockMinute = 22 * 60;
+int8_t lastScheduleTarget = -1;
+
+WebServer webServer(80);
+Preferences preferences;
 
 // ------------------------------- TOF sensors --------------------------------
 
@@ -303,7 +346,8 @@ void driveMotor(const Motor &motor, bool extend);
 void stopPair(MotorPair &pair);
 void startExtending(MotorPair &pair, uint32_t nowMs);
 void startRetracting(MotorPair &pair, uint32_t nowMs);
-void updateMotorPair(MotorPair &pair, bool retractCondition, uint32_t nowMs);
+void updateMotorPair(MotorPair &pair, bool retractCondition,
+                     bool immediateExtend, uint32_t nowMs);
 const char *pairStateName(PairState state);
 uint32_t clearWaitRemainingMs(const MotorPair &pair, uint32_t nowMs);
 void printMotorPair(const char *location, const MotorPair &pair,
@@ -354,7 +398,7 @@ void startRetracting(MotorPair &pair, uint32_t nowMs) {
 }
 
 void updateMotorPair(MotorPair &pair, bool retractCondition,
-                     uint32_t nowMs) {
+                     bool immediateExtend, uint32_t nowMs) {
   switch (pair.state) {
     case PAIR_EXTENDING:
       if (retractCondition) {
@@ -375,7 +419,11 @@ void updateMotorPair(MotorPair &pair, bool retractCondition,
       break;
 
     case PAIR_RETRACTING:
-      if (nowMs - pair.stateStartedMs >= ACTUATOR_TRAVEL_TIME_MS) {
+      if (immediateExtend) {
+        stopPair(pair);
+        pair.state = PAIR_REVERSAL_PAUSE;
+        pair.stateStartedMs = nowMs;
+      } else if (nowMs - pair.stateStartedMs >= ACTUATOR_TRAVEL_TIME_MS) {
         stopPair(pair);
         pair.stateStartedMs = nowMs;
         if (retractCondition) {
@@ -388,14 +436,18 @@ void updateMotorPair(MotorPair &pair, bool retractCondition,
       break;
 
     case PAIR_RETRACTED_ACTIVE:
-      if (!retractCondition) {
+      if (immediateExtend) {
+        startExtending(pair, nowMs);
+      } else if (!retractCondition) {
         pair.state = PAIR_RETRACTED_CLEAR_WAIT;
         pair.clearStartedMs = nowMs;
       }
       break;
 
     case PAIR_RETRACTED_CLEAR_WAIT:
-      if (retractCondition) {
+      if (immediateExtend) {
+        startExtending(pair, nowMs);
+      } else if (retractCondition) {
         pair.state = PAIR_RETRACTED_ACTIVE;
       } else if (nowMs - pair.clearStartedMs >= CONDITIONS_CLEAR_DELAY_MS) {
         startExtending(pair, nowMs);
@@ -421,7 +473,7 @@ const char *pairStateName(PairState state) {
     case PAIR_EXTENDED: return "EXTENDED (locked)";
     case PAIR_RETRACTING: return "RETRACTING (opening)";
     case PAIR_RETRACTED_ACTIVE: return "RETRACTED (condition active)";
-    case PAIR_RETRACTED_CLEAR_WAIT: return "RETRACTED (10 s clear-wait)";
+    case PAIR_RETRACTED_CLEAR_WAIT: return "RETRACTED (20 s clear-wait)";
     case PAIR_REVERSAL_PAUSE: return "STOPPED (direction-change pause)";
   }
   return "UNKNOWN";
@@ -488,7 +540,7 @@ const char *overallDoorStage(bool outboundCondition, bool inboundCondition) {
   }
   if (outsidePair.state == PAIR_RETRACTED_CLEAR_WAIT ||
       insidePair.state == PAIR_RETRACTED_CLEAR_WAIT) {
-    return "CONDITIONS FALSE - 10 s CLEAR-WAIT ACTIVE";
+    return "CONDITIONS FALSE - 20 s CLEAR-WAIT ACTIVE";
   }
   if (outsidePair.state == PAIR_RETRACTING ||
       insidePair.state == PAIR_RETRACTING) {
@@ -510,8 +562,9 @@ const char *overallDoorStage(bool outboundCondition, bool inboundCondition) {
 }
 
 void printStatus(uint32_t nowMs, bool tagPresent, bool insideNear,
-                 bool outsideNear, bool outboundCondition,
-                 bool inboundCondition) {
+                 bool outsideNear, bool automaticOutboundCondition,
+                 bool automaticInboundCondition, bool outsideRetractDemand,
+                 bool insideRetractDemand) {
   Serial.println();
   Serial.printf("================ SMART DOOR @ %lu ms ================\n", nowMs);
   printRfidReading(nowMs, tagPresent);
@@ -521,13 +574,391 @@ void printStatus(uint32_t nowMs, bool tagPresent, bool insideNear,
                 tagPresent ? "YES" : "NO", insideNear ? "YES" : "NO",
                 outsideNear ? "YES" : "NO");
   Serial.printf("OUTBOUND condition (opens OUTSIDE motors): %s\n",
-                outboundCondition ? "TRUE" : "FALSE");
+                automaticOutboundCondition ? "TRUE" : "FALSE");
   Serial.printf("INBOUND condition  (opens INSIDE motors) : %s\n",
-                inboundCondition ? "TRUE" : "FALSE");
+                automaticInboundCondition ? "TRUE" : "FALSE");
+  Serial.printf("CONTROL MODE: %s", operationModeName(activeMode));
+  if (modeChangePending) {
+    Serial.printf(" | PENDING: %s", operationModeName(pendingMode));
+  }
+  Serial.printf(" | forced-change safety=%s\n",
+                forcedChangeIsSafe(nowMs) ? "CLEAR" : "BLOCKED");
   Serial.printf("DOOR STAGE: %s\n",
-                overallDoorStage(outboundCondition, inboundCondition));
+                overallDoorStage(outsideRetractDemand, insideRetractDemand));
   printMotorPair("OUTSIDE", outsidePair, nowMs);
   printMotorPair("INSIDE ", insidePair, nowMs);
+}
+
+// -------------------------- Mode and safety control -------------------------
+
+const char *operationModeName(OperationMode mode) {
+  switch (mode) {
+    case MODE_AUTOMATIC: return "AUTOMATIC";
+    case MODE_FORCE_OPEN: return "FORCE OPEN";
+    case MODE_FORCE_LOCKED: return "FORCE LOCKED";
+  }
+  return "UNKNOWN";
+}
+
+bool forcedChangeIsSafe(uint32_t nowMs) {
+  // Invalid or stale TOF data is deliberately treated as unsafe.
+  return !rfidTagIsPresent(nowMs) && insideTof.initialized && insideTof.valid &&
+         outsideTof.initialized && outsideTof.valid && !tofIsNear(insideTof) &&
+         !tofIsNear(outsideTof);
+}
+
+void requestOperationMode(OperationMode requestedMode, const char *source,
+                          bool safetyClear) {
+  preferences.putUChar("savedMode", (uint8_t)requestedMode);
+
+  if (requestedMode == MODE_AUTOMATIC) {
+    activeMode = MODE_AUTOMATIC;
+    pendingMode = MODE_AUTOMATIC;
+    modeChangePending = false;
+    Serial.printf("MODE: AUTOMATIC activated by %s.\n", source);
+    return;
+  }
+
+  if (requestedMode == activeMode) {
+    pendingMode = requestedMode;
+    modeChangePending = false;
+    Serial.printf("MODE: %s was already active when requested by %s.\n",
+                  operationModeName(requestedMode), source);
+    return;
+  }
+
+  if (safetyClear) {
+    activeMode = requestedMode;
+    pendingMode = requestedMode;
+    modeChangePending = false;
+    Serial.printf("MODE: %s activated by %s; safety area is clear.\n",
+                  operationModeName(requestedMode), source);
+  } else {
+    pendingMode = requestedMode;
+    modeChangePending = true;
+    Serial.printf("MODE: %s requested by %s but is PENDING until RFID is clear "
+                  "and both valid TOF readings exceed %u mm.\n",
+                  operationModeName(requestedMode), source,
+                  TOF_TRIGGER_DISTANCE_MM);
+  }
+}
+
+void applyPendingModeWhenSafe(uint32_t nowMs) {
+  if (modeChangePending && forcedChangeIsSafe(nowMs)) {
+    activeMode = pendingMode;
+    modeChangePending = false;
+    Serial.printf("MODE: pending %s is now active; safety area became clear.\n",
+                  operationModeName(activeMode));
+  }
+}
+
+// --------------------------- Daily schedule logic ---------------------------
+
+bool parseClockTime(const String &text, uint16_t &minuteOfDay) {
+  if (text.length() != 5 || text.charAt(2) != ':') {
+    return false;
+  }
+  const int hour = text.substring(0, 2).toInt();
+  const int minute = text.substring(3, 5).toInt();
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    return false;
+  }
+  minuteOfDay = hour * 60 + minute;
+  return true;
+}
+
+String formatClockTime(uint16_t minuteOfDay) {
+  char value[6];
+  snprintf(value, sizeof(value), "%02u:%02u", minuteOfDay / 60,
+           minuteOfDay % 60);
+  return String(value);
+}
+
+OperationMode scheduledModeAt(uint16_t minuteOfDay) {
+  if (scheduledOpenMinute < scheduledLockMinute) {
+    return minuteOfDay >= scheduledOpenMinute &&
+                   minuteOfDay < scheduledLockMinute
+             ? MODE_FORCE_OPEN
+             : MODE_FORCE_LOCKED;
+  }
+
+  // An opening time later than the locking time represents an overnight
+  // open interval, such as 20:00 through 06:00.
+  return minuteOfDay >= scheduledOpenMinute ||
+                 minuteOfDay < scheduledLockMinute
+           ? MODE_FORCE_OPEN
+           : MODE_FORCE_LOCKED;
+}
+
+bool getDoorLocalTime(struct tm &timeInfo) {
+  return getLocalTime(&timeInfo, 10);
+}
+
+void updateDailySchedule(uint32_t nowMs) {
+  static uint32_t lastCheckMs = 0;
+  if (!scheduleEnabled || nowMs - lastCheckMs < SCHEDULE_CHECK_PERIOD_MS) {
+    return;
+  }
+  lastCheckMs = nowMs;
+
+  struct tm timeInfo;
+  if (!getDoorLocalTime(timeInfo)) {
+    return;
+  }
+
+  const uint16_t minuteOfDay = timeInfo.tm_hour * 60 + timeInfo.tm_min;
+  const OperationMode target = scheduledModeAt(minuteOfDay);
+  if ((int8_t)target != lastScheduleTarget) {
+    lastScheduleTarget = (int8_t)target;
+    requestOperationMode(target, "daily schedule", forcedChangeIsSafe(nowMs));
+  }
+}
+
+// ------------------------------- Web control --------------------------------
+
+const char CONTROL_PAGE[] PROGMEM = R"HTML(
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Smart Cat Door</title>
+  <style>
+    :root{color-scheme:dark;--bg:#10151b;--card:#1a222c;--line:#314050;--text:#edf3f7;--muted:#9cb0c0;--green:#37c978;--red:#ff6670;--amber:#f4bd50;--blue:#55a8ff}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px system-ui,sans-serif}main{width:min(980px,94vw);margin:28px auto 60px}h1{font-size:clamp(1.8rem,5vw,2.7rem);margin:0 0 5px}h2{font-size:1.05rem;margin:0 0 14px}.subtitle,.note{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;margin-top:18px}.card{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:18px}.wide{grid-column:1/-1}.value{font-size:1.25rem;font-weight:750}.row{display:flex;justify-content:space-between;gap:14px;padding:7px 0;border-bottom:1px solid #26313d}.row:last-child{border:0}.ok{color:var(--green)}.warn{color:var(--amber)}.bad{color:var(--red)}button{border:0;border-radius:10px;padding:12px 15px;margin:4px 5px 4px 0;font-weight:750;cursor:pointer;color:#071017}.auto{background:var(--blue)}.open{background:var(--green)}.lock{background:var(--red)}.save{background:var(--amber)}input[type=time]{background:#111820;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px;font:inherit;margin:5px 12px 5px 5px}.pending{border-color:var(--amber)}#message{min-height:24px;color:var(--amber);margin-top:10px}.small{font-size:.88rem}.pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:5px 10px;margin:3px 4px 3px 0}
+  </style>
+</head>
+<body><main>
+  <h1>Smart Cat Door</h1>
+  <div class="subtitle">Local ESP32 control panel</div>
+  <div class="grid">
+    <section class="card wide" id="modeCard">
+      <h2>Door control</h2>
+      <div class="row"><span>Active mode</span><span class="value" id="activeMode">—</span></div>
+      <div class="row"><span>Requested mode</span><span id="pendingMode">None</span></div>
+      <div class="row"><span>Door stage</span><span id="stage">—</span></div>
+      <div style="margin-top:14px">
+        <button class="auto" onclick="setMode('auto')">Automatic</button>
+        <button class="open" onclick="setMode('open')">Force Open</button>
+        <button class="lock" onclick="setMode('locked')">Force Locked</button>
+      </div>
+      <div id="message"></div>
+      <div class="note small">Force Open and Force Locked remain pending until no RFID tag is present and both valid TOF readings are beyond 25 cm.</div>
+    </section>
+    <section class="card">
+      <h2>Sensors</h2>
+      <div class="row"><span>RFID</span><span id="rfid">—</span></div>
+      <div class="row"><span>Inside TOF</span><span id="insideTof">—</span></div>
+      <div class="row"><span>Outside TOF</span><span id="outsideTof">—</span></div>
+      <div class="row"><span>Forced-mode safety</span><span id="safe">—</span></div>
+    </section>
+    <section class="card">
+      <h2>Motor pairs</h2>
+      <div class="row"><span>Outside driver 1 · left</span><span id="outsideLeft">—</span></div>
+      <div class="row"><span>Outside driver 2 · right</span><span id="outsideRight">—</span></div>
+      <div class="row"><span>Inside driver 1 · left</span><span id="insideLeft">—</span></div>
+      <div class="row"><span>Inside driver 2 · right</span><span id="insideRight">—</span></div>
+      <div class="note small" style="margin-top:10px">Positions are commanded/assumed because there are no limit switches.</div>
+    </section>
+    <section class="card wide">
+      <h2>Daily forced-mode schedule</h2>
+      <label><input id="scheduleEnabled" type="checkbox"> Enable every day</label><br><br>
+      <label>Force open at <input id="openTime" type="time" value="08:00"></label>
+      <label>Force locked at <input id="lockTime" type="time" value="22:00"></label>
+      <button class="save" onclick="saveSchedule()">Save schedule</button>
+      <div class="note small" style="margin-top:10px">The scheduled change is also held pending by the safety interlock. An overnight interval is supported.</div>
+      <div class="row" style="margin-top:12px"><span>ESP32 local time</span><span id="localTime">Waiting for NTP</span></div>
+    </section>
+  </div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+function showMessage(text){$('message').textContent=text;setTimeout(()=>{$('message').textContent=''},5000)}
+async function setMode(value){
+  try{const r=await fetch('/api/mode',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'value='+encodeURIComponent(value)});const j=await r.json();showMessage(j.message);refresh()}catch(e){showMessage('Could not contact the door controller.')}
+}
+async function saveSchedule(){
+  const body=new URLSearchParams({enabled:$('scheduleEnabled').checked?'1':'0',open:$('openTime').value,locked:$('lockTime').value});
+  try{const r=await fetch('/api/schedule',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});const j=await r.json();showMessage(j.message);refresh()}catch(e){showMessage('Could not save the schedule.')}
+}
+function tofText(sensor){return sensor.valid?`${sensor.mm} mm (${(sensor.mm/10).toFixed(1)} cm)${sensor.near?' · DETECTED':' · clear'}`:sensor.initialized?'Unavailable / stale':'Not initialized'}
+async function refresh(){
+  try{const r=await fetch('/api/status',{cache:'no-store'});const s=await r.json();
+    $('activeMode').textContent=s.activeMode;$('pendingMode').textContent=s.pending?s.pendingMode+' (waiting for clear area)':'None';$('modeCard').classList.toggle('pending',s.pending);$('stage').textContent=s.stage;
+    $('rfid').textContent=s.rfid.present?'TAG PRESENT'+(s.rfid.epc?' · '+s.rfid.epc:''):'No tag';$('insideTof').textContent=tofText(s.insideTof);$('outsideTof').textContent=tofText(s.outsideTof);$('safe').textContent=s.safeForForcedChange?'CLEAR':'BLOCKED';$('safe').className=s.safeForForcedChange?'ok':'bad';
+    $('outsideLeft').textContent=s.outsideMotors;$('outsideRight').textContent=s.outsideMotors;$('insideLeft').textContent=s.insideMotors;$('insideRight').textContent=s.insideMotors;
+    if(document.activeElement.tagName!=='INPUT'){$('scheduleEnabled').checked=s.schedule.enabled;$('openTime').value=s.schedule.open;$('lockTime').value=s.schedule.locked}$('localTime').textContent=s.localTime;
+  }catch(e){$('stage').textContent='Controller offline'}
+}
+refresh();setInterval(refresh,1000);
+</script></body></html>
+)HTML";
+
+String jsonBool(bool value) {
+  return value ? "true" : "false";
+}
+
+String currentEpcText() {
+  String epc;
+  epc.reserve(lastTagEpcLength * 2);
+  char byteText[3];
+  for (size_t index = 0; index < lastTagEpcLength; ++index) {
+    snprintf(byteText, sizeof(byteText), "%02X", lastTagEpc[index]);
+    epc += byteText;
+  }
+  return epc;
+}
+
+String currentLocalTimeText() {
+  struct tm timeInfo;
+  if (!getDoorLocalTime(timeInfo)) {
+    return "Waiting for network time";
+  }
+  char text[32];
+  strftime(text, sizeof(text), "%a %Y-%m-%d %H:%M:%S", &timeInfo);
+  return String(text);
+}
+
+String tofJson(const TofReading &reading) {
+  String json = "{\"initialized\":" + jsonBool(reading.initialized);
+  json += ",\"valid\":" + jsonBool(reading.valid);
+  json += ",\"near\":" + jsonBool(tofIsNear(reading));
+  json += ",\"mm\":" + String(reading.distanceMm) + "}";
+  return json;
+}
+
+void handleStatusRequest() {
+  const uint32_t nowMs = millis();
+  const bool tagPresent = rfidTagIsPresent(nowMs);
+  const bool insideNear = tofIsNear(insideTof);
+  const bool outsideNear = tofIsNear(outsideTof);
+  const bool automaticOutbound = tagPresent && insideNear;
+  const bool automaticInbound = tagPresent && outsideNear;
+  const bool outsideRetract = activeMode == MODE_FORCE_OPEN ||
+                              (activeMode == MODE_AUTOMATIC && automaticOutbound);
+  const bool insideRetract = activeMode == MODE_FORCE_OPEN ||
+                             (activeMode == MODE_AUTOMATIC && automaticInbound);
+
+  String json;
+  json.reserve(1100);
+  json = "{\"activeMode\":\"" + String(operationModeName(activeMode)) + "\"";
+  json += ",\"pending\":" + jsonBool(modeChangePending);
+  json += ",\"pendingMode\":\"" + String(operationModeName(pendingMode)) + "\"";
+  json += ",\"stage\":\"" +
+          String(overallDoorStage(outsideRetract, insideRetract)) + "\"";
+  json += ",\"safeForForcedChange\":" + jsonBool(forcedChangeIsSafe(nowMs));
+  json += ",\"rfid\":{\"present\":" + jsonBool(tagPresent) +
+          ",\"epc\":\"" + currentEpcText() + "\"}";
+  json += ",\"insideTof\":" + tofJson(insideTof);
+  json += ",\"outsideTof\":" + tofJson(outsideTof);
+  json += ",\"outsideMotors\":\"" + String(pairStateName(outsidePair.state)) + "\"";
+  json += ",\"insideMotors\":\"" + String(pairStateName(insidePair.state)) + "\"";
+  json += ",\"schedule\":{\"enabled\":" + jsonBool(scheduleEnabled) +
+          ",\"open\":\"" + formatClockTime(scheduledOpenMinute) +
+          "\",\"locked\":\"" + formatClockTime(scheduledLockMinute) + "\"}";
+  json += ",\"localTime\":\"" + currentLocalTimeText() + "\"}";
+  webServer.send(200, "application/json", json);
+}
+
+void handleModeRequest() {
+  if (!webServer.hasArg("value")) {
+    webServer.send(400, "application/json", "{\"message\":\"Missing mode.\"}");
+    return;
+  }
+
+  const String value = webServer.arg("value");
+  OperationMode requestedMode;
+  if (value == "auto") {
+    requestedMode = MODE_AUTOMATIC;
+  } else if (value == "open") {
+    requestedMode = MODE_FORCE_OPEN;
+  } else if (value == "locked") {
+    requestedMode = MODE_FORCE_LOCKED;
+  } else {
+    webServer.send(400, "application/json", "{\"message\":\"Invalid mode.\"}");
+    return;
+  }
+
+  const bool safetyClear = forcedChangeIsSafe(millis());
+  requestOperationMode(requestedMode, "web page", safetyClear);
+  const String message = modeChangePending
+                           ? String(operationModeName(requestedMode)) +
+                               " is pending until RFID and both TOFs are clear."
+                           : String(operationModeName(requestedMode)) + " is active.";
+  webServer.send(200, "application/json",
+                 "{\"message\":\"" + message + "\"}");
+}
+
+void handleScheduleRequest() {
+  if (!webServer.hasArg("enabled") || !webServer.hasArg("open") ||
+      !webServer.hasArg("locked")) {
+    webServer.send(400, "application/json",
+                   "{\"message\":\"Schedule fields are missing.\"}");
+    return;
+  }
+
+  uint16_t openMinute;
+  uint16_t lockMinute;
+  if (!parseClockTime(webServer.arg("open"), openMinute) ||
+      !parseClockTime(webServer.arg("locked"), lockMinute) ||
+      openMinute == lockMinute) {
+    webServer.send(400, "application/json",
+                   "{\"message\":\"Choose two different valid times.\"}");
+    return;
+  }
+
+  scheduleEnabled = webServer.arg("enabled") == "1";
+  scheduledOpenMinute = openMinute;
+  scheduledLockMinute = lockMinute;
+  lastScheduleTarget = -1;
+  preferences.putBool("schedOn", scheduleEnabled);
+  preferences.putUShort("openMin", scheduledOpenMinute);
+  preferences.putUShort("lockMin", scheduledLockMinute);
+
+  webServer.send(200, "application/json",
+                 scheduleEnabled
+                   ? "{\"message\":\"Daily schedule saved and enabled.\"}"
+                   : "{\"message\":\"Schedule saved but disabled.\"}");
+}
+
+void startWebServer() {
+  webServer.on("/", HTTP_GET, []() {
+    webServer.send_P(200, "text/html", CONTROL_PAGE);
+  });
+  webServer.on("/api/status", HTTP_GET, handleStatusRequest);
+  webServer.on("/api/mode", HTTP_POST, handleModeRequest);
+  webServer.on("/api/schedule", HTTP_POST, handleScheduleRequest);
+  webServer.onNotFound([]() {
+    webServer.send(404, "text/plain", "Not found");
+  });
+  webServer.begin();
+}
+
+void updateWifi(uint32_t nowMs) {
+  static uint32_t lastAttemptMs = 0;
+  static bool servicesStarted = false;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!servicesStarted) {
+      servicesStarted = true;
+      if (MDNS.begin("smartdoor")) {
+        MDNS.addService("http", "tcp", 80);
+      }
+      configTzTime(TIME_ZONE, NTP_SERVER_1, NTP_SERVER_2);
+      Serial.printf("WEB: connected to %s. Open http://smartdoor.local/ or http://%s/\n",
+                    WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    }
+    webServer.handleClient();
+    return;
+  }
+
+  servicesStarted = false;
+  if (nowMs - lastAttemptMs >= WIFI_RETRY_PERIOD_MS) {
+    lastAttemptMs = nowMs;
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.println("WEB: attempting Wi-Fi connection...");
+  }
 }
 
 // -------------------------------- Arduino -----------------------------------
@@ -537,6 +968,18 @@ void setup() {
   delay(1000);
   Serial.println();
   Serial.println("Integrated smart cat-door controller starting");
+
+  preferences.begin("smartdoor", false);
+  scheduleEnabled = preferences.getBool("schedOn", false);
+  scheduledOpenMinute = preferences.getUShort("openMin", 8 * 60);
+  scheduledLockMinute = preferences.getUShort("lockMin", 22 * 60);
+  const uint8_t savedMode = preferences.getUChar("savedMode", MODE_AUTOMATIC);
+  if (savedMode == MODE_FORCE_OPEN || savedMode == MODE_FORCE_LOCKED) {
+    pendingMode = (OperationMode)savedMode;
+    modeChangePending = true;
+    Serial.printf("MODE: restored %s as pending until the safety area is clear.\n",
+                  operationModeName(pendingMode));
+  }
 
   initializeMotor(outsideLeftMotor);
   initializeMotor(outsideRightMotor);
@@ -559,6 +1002,16 @@ void setup() {
   Serial.printf("RFID UART ready: RX GPIO %u, TX GPIO %u, %lu baud.\n",
                 RFID_RX_PIN, RFID_TX_PIN, RFID_UART_BAUD);
 
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  startWebServer();
+  if (String(WIFI_SSID) == "YOUR_WIFI_NAME") {
+    Serial.println("WEB: copy arduino_secrets.h.example to arduino_secrets.h, then enter Wi-Fi credentials.");
+  } else {
+    Serial.printf("WEB: connecting to Wi-Fi network %s...\n", WIFI_SSID);
+  }
+
   // Establish a known locked state at startup. The actuators stop after the
   // configured travel time; there are no position switches in this design.
   const uint32_t nowMs = millis();
@@ -574,24 +1027,42 @@ void loop() {
   updateRfid(nowMs);
   updateTofSensor(outsideSensor, outsideTof, nowMs);
   updateTofSensor(insideSensor, insideTof, nowMs);
+  updateWifi(nowMs);
+  updateDailySchedule(nowMs);
+  applyPendingModeWhenSafe(nowMs);
 
   const bool tagPresent = rfidTagIsPresent(nowMs);
   const bool insideNear = tofIsNear(insideTof);
   const bool outsideNear = tofIsNear(outsideTof);
 
   // A cat on the inside opens the outside locks to permit outward travel.
-  const bool outboundCondition = tagPresent && insideNear;
+  const bool automaticOutboundCondition = tagPresent && insideNear;
   // A cat on the outside opens the inside locks to permit inward travel.
-  const bool inboundCondition = tagPresent && outsideNear;
+  const bool automaticInboundCondition = tagPresent && outsideNear;
 
-  updateMotorPair(outsidePair, outboundCondition, nowMs);
-  updateMotorPair(insidePair, inboundCondition, nowMs);
+  bool outsideRetractDemand = false;
+  bool insideRetractDemand = false;
+  bool immediateExtend = false;
+
+  if (activeMode == MODE_FORCE_OPEN) {
+    outsideRetractDemand = true;
+    insideRetractDemand = true;
+  } else if (activeMode == MODE_FORCE_LOCKED) {
+    immediateExtend = true;
+  } else {
+    outsideRetractDemand = automaticOutboundCondition;
+    insideRetractDemand = automaticInboundCondition;
+  }
+
+  updateMotorPair(outsidePair, outsideRetractDemand, immediateExtend, nowMs);
+  updateMotorPair(insidePair, insideRetractDemand, immediateExtend, nowMs);
 
   static uint32_t lastReportMs = 0;
   if (nowMs - lastReportMs >= SERIAL_REPORT_PERIOD_MS) {
     lastReportMs = nowMs;
     printStatus(nowMs, tagPresent, insideNear, outsideNear,
-                outboundCondition, inboundCondition);
+                automaticOutboundCondition, automaticInboundCondition,
+                outsideRetractDemand, insideRetractDemand);
   }
 
   delay(1);
