@@ -143,9 +143,12 @@ OperationMode activeMode = MODE_AUTOMATIC;
 OperationMode pendingMode = MODE_AUTOMATIC;
 bool modeChangePending = false;
 
-bool scheduleEnabled = false;
-uint16_t scheduledOpenMinute = 8 * 60;
-uint16_t scheduledLockMinute = 22 * 60;
+bool lockedScheduleEnabled = false;
+uint16_t lockedScheduleStartMinute = 22 * 60;
+uint16_t lockedScheduleEndMinute = 8 * 60;
+bool openScheduleEnabled = false;
+uint16_t openScheduleStartMinute = 8 * 60;
+uint16_t openScheduleEndMinute = 22 * 60;
 int8_t lastScheduleTarget = -1;
 
 DoorLogStorage doorLog = {DOOR_LOG_MAGIC, 0, 0, {}};
@@ -790,20 +793,32 @@ String formatClockTime(uint16_t minuteOfDay) {
   return String(value);
 }
 
-OperationMode scheduledModeAt(uint16_t minuteOfDay) {
-  if (scheduledOpenMinute < scheduledLockMinute) {
-    return minuteOfDay >= scheduledOpenMinute &&
-                   minuteOfDay < scheduledLockMinute
-             ? MODE_FORCE_OPEN
-             : MODE_FORCE_LOCKED;
+bool minuteIsInWindow(uint16_t minuteOfDay, uint16_t startMinute,
+                      uint16_t endMinute) {
+  if (startMinute < endMinute) {
+    return minuteOfDay >= startMinute && minuteOfDay < endMinute;
   }
+  // A start later than the end represents an overnight interval.
+  return minuteOfDay >= startMinute || minuteOfDay < endMinute;
+}
 
-  // An opening time later than the locking time represents an overnight
-  // open interval, such as 20:00 through 06:00.
-  return minuteOfDay >= scheduledOpenMinute ||
-                 minuteOfDay < scheduledLockMinute
-           ? MODE_FORCE_OPEN
-           : MODE_FORCE_LOCKED;
+bool schedulesAreEnabled() {
+  return lockedScheduleEnabled || openScheduleEnabled;
+}
+
+OperationMode scheduledModeAt(uint16_t minuteOfDay) {
+  // Locked wins when two enabled windows overlap.
+  if (lockedScheduleEnabled &&
+      minuteIsInWindow(minuteOfDay, lockedScheduleStartMinute,
+                       lockedScheduleEndMinute)) {
+    return MODE_FORCE_LOCKED;
+  }
+  if (openScheduleEnabled &&
+      minuteIsInWindow(minuteOfDay, openScheduleStartMinute,
+                       openScheduleEndMinute)) {
+    return MODE_FORCE_OPEN;
+  }
+  return MODE_AUTOMATIC;
 }
 
 bool getDoorLocalTime(struct tm &timeInfo) {
@@ -812,7 +827,11 @@ bool getDoorLocalTime(struct tm &timeInfo) {
 
 void updateDailySchedule(uint32_t nowMs) {
   static uint32_t lastCheckMs = 0;
-  if (!scheduleEnabled || nowMs - lastCheckMs < SCHEDULE_CHECK_PERIOD_MS) {
+  if (!schedulesAreEnabled()) {
+    lastScheduleTarget = -1;
+    return;
+  }
+  if (nowMs - lastCheckMs < SCHEDULE_CHECK_PERIOD_MS) {
     return;
   }
   lastCheckMs = nowMs;
@@ -947,12 +966,11 @@ const char CONTROL_PAGE[] PROGMEM = R"HTML(
       <div class="note small" style="margin-top:10px">Positions are commanded/assumed because there are no limit switches.</div>
     </section>
     <section class="card wide">
-      <h2>Daily forced-mode schedule</h2>
-      <label><input id="scheduleEnabled" type="checkbox"> Enable every day</label><br><br>
-      <label>Force open at <input id="openTime" type="time" value="08:00"></label>
-      <label>Force locked at <input id="lockTime" type="time" value="22:00"></label>
-      <button class="save" onclick="saveSchedule()">Save schedule</button>
-      <div class="note small" style="margin-top:10px">The scheduled change is also held pending by the safety interlock. An overnight interval is supported.</div>
+      <h2>Daily schedules</h2>
+      <div class="row"><label><input id="lockScheduleEnabled" type="checkbox"> Force locked</label><span><input id="lockStart" type="time" value="22:00"> to <input id="lockEnd" type="time" value="08:00"></span></div>
+      <div class="row"><label><input id="openScheduleEnabled" type="checkbox"> Force open</label><span><input id="openStart" type="time" value="08:00"> to <input id="openEnd" type="time" value="22:00"></span></div>
+      <button class="save" onclick="saveSchedules()">Save schedules</button>
+      <div class="note small" style="margin-top:10px">Outside enabled windows, the door runs in Automatic mode. Overnight windows are supported; locked takes priority if windows overlap.</div>
       <div class="row" style="margin-top:12px"><span>ESP32 local time</span><span id="localTime">Waiting for NTP</span></div>
     </section>
     <section class="card wide">
@@ -968,8 +986,8 @@ function showMessage(text){$('message').textContent=text;setTimeout(()=>{$('mess
 async function setMode(value){
   try{const r=await fetch('/api/mode',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'value='+encodeURIComponent(value)});const j=await r.json();showMessage(j.message);refresh()}catch(e){showMessage('Could not contact the door controller.')}
 }
-async function saveSchedule(){
-  const body=new URLSearchParams({enabled:$('scheduleEnabled').checked?'1':'0',open:$('openTime').value,locked:$('lockTime').value});
+async function saveSchedules(){
+  const body=new URLSearchParams({lockEnabled:$('lockScheduleEnabled').checked?'1':'0',lockStart:$('lockStart').value,lockEnd:$('lockEnd').value,openEnabled:$('openScheduleEnabled').checked?'1':'0',openStart:$('openStart').value,openEnd:$('openEnd').value});
   try{const r=await fetch('/api/schedule',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});const j=await r.json();showMessage(j.message);refresh()}catch(e){showMessage('Could not save the schedule.')}
 }
 function tofText(sensor){return sensor.valid?`${sensor.mm} mm (${(sensor.mm/10).toFixed(1)} cm)${sensor.near?' · DETECTED':' · clear'}`:sensor.initialized?'Unavailable / stale':'Not initialized'}
@@ -978,7 +996,7 @@ async function refresh(){
     $('activeMode').textContent=s.activeMode;$('pendingMode').textContent=s.pending?s.pendingMode+' (waiting for clear area)':'None';$('modeCard').classList.toggle('pending',s.pending);$('stage').textContent=s.stage;
     $('rfid').textContent=s.rfid.present?'TAG PRESENT'+(s.rfid.epc?' · '+s.rfid.epc:''):'No tag';$('insideTof').textContent=tofText(s.insideTof);$('outsideTof').textContent=tofText(s.outsideTof);$('safe').textContent=s.safeForForcedChange?'CLEAR':'BLOCKED';$('safe').className=s.safeForForcedChange?'ok':'bad';
     $('outsideLeft').textContent=s.outsideMotors;$('outsideRight').textContent=s.outsideMotors;$('insideLeft').textContent=s.insideMotors;$('insideRight').textContent=s.insideMotors;
-    if(document.activeElement.tagName!=='INPUT'){$('scheduleEnabled').checked=s.schedule.enabled;$('openTime').value=s.schedule.open;$('lockTime').value=s.schedule.locked}$('localTime').textContent=s.localTime;
+    if(document.activeElement.tagName!=='INPUT'){$('lockScheduleEnabled').checked=s.schedule.lockEnabled;$('lockStart').value=s.schedule.lockStart;$('lockEnd').value=s.schedule.lockEnd;$('openScheduleEnabled').checked=s.schedule.openEnabled;$('openStart').value=s.schedule.openStart;$('openEnd').value=s.schedule.openEnd}$('localTime').textContent=s.localTime;
   }catch(e){$('stage').textContent='Controller offline'}
 }
 async function refreshHistory(){
@@ -1029,8 +1047,13 @@ void handleStatusRequest() {
   const bool tagPresent = rfidTagIsPresent(nowMs);
   const bool insideNear = tofIsNear(insideTof);
   const bool outsideNear = tofIsNear(outsideTof);
-  const bool automaticOutbound = tagPresent && insideNear;
-  const bool automaticInbound = tagPresent && outsideNear;
+  bool automaticOutbound = tagPresent && outsideNear;
+  bool automaticInbound = tagPresent && insideNear;
+  if (outsidePair.openingClaimed || automaticOutbound) {
+    automaticInbound = false;
+  } else if (insidePair.openingClaimed || automaticInbound) {
+    automaticOutbound = false;
+  }
   const bool outsideRetract = activeMode == MODE_FORCE_OPEN ||
                               (activeMode == MODE_AUTOMATIC && automaticOutbound);
   const bool insideRetract = activeMode == MODE_FORCE_OPEN ||
@@ -1050,9 +1073,13 @@ void handleStatusRequest() {
   json += ",\"outsideTof\":" + tofJson(outsideTof);
   json += ",\"outsideMotors\":\"" + String(pairStateName(outsidePair.state)) + "\"";
   json += ",\"insideMotors\":\"" + String(pairStateName(insidePair.state)) + "\"";
-  json += ",\"schedule\":{\"enabled\":" + jsonBool(scheduleEnabled) +
-          ",\"open\":\"" + formatClockTime(scheduledOpenMinute) +
-          "\",\"locked\":\"" + formatClockTime(scheduledLockMinute) + "\"}";
+  json += ",\"schedule\":{\"lockEnabled\":" +
+          jsonBool(lockedScheduleEnabled) + ",\"lockStart\":\"" +
+          formatClockTime(lockedScheduleStartMinute) + "\",\"lockEnd\":\"" +
+          formatClockTime(lockedScheduleEndMinute) + "\",\"openEnabled\":" +
+          jsonBool(openScheduleEnabled) + ",\"openStart\":\"" +
+          formatClockTime(openScheduleStartMinute) + "\",\"openEnd\":\"" +
+          formatClockTime(openScheduleEndMinute) + "\"}";
   json += ",\"localTime\":\"" + currentLocalTimeText() + "\"}";
   webServer.send(200, "application/json", json);
 }
@@ -1108,35 +1135,54 @@ void handleModeRequest() {
 }
 
 void handleScheduleRequest() {
-  if (!webServer.hasArg("enabled") || !webServer.hasArg("open") ||
-      !webServer.hasArg("locked")) {
+  if (!webServer.hasArg("lockEnabled") || !webServer.hasArg("lockStart") ||
+      !webServer.hasArg("lockEnd") || !webServer.hasArg("openEnabled") ||
+      !webServer.hasArg("openStart") || !webServer.hasArg("openEnd")) {
     webServer.send(400, "application/json",
                    "{\"message\":\"Schedule fields are missing.\"}");
     return;
   }
 
-  uint16_t openMinute;
-  uint16_t lockMinute;
-  if (!parseClockTime(webServer.arg("open"), openMinute) ||
-      !parseClockTime(webServer.arg("locked"), lockMinute) ||
-      openMinute == lockMinute) {
+  uint16_t lockStartMinute;
+  uint16_t lockEndMinute;
+  uint16_t openStartMinute;
+  uint16_t openEndMinute;
+  if (!parseClockTime(webServer.arg("lockStart"), lockStartMinute) ||
+      !parseClockTime(webServer.arg("lockEnd"), lockEndMinute) ||
+      !parseClockTime(webServer.arg("openStart"), openStartMinute) ||
+      !parseClockTime(webServer.arg("openEnd"), openEndMinute)) {
     webServer.send(400, "application/json",
-                   "{\"message\":\"Choose two different valid times.\"}");
+                   "{\"message\":\"Use valid start and end times.\"}");
     return;
   }
 
-  scheduleEnabled = webServer.arg("enabled") == "1";
-  scheduledOpenMinute = openMinute;
-  scheduledLockMinute = lockMinute;
+  const bool requestedLockEnabled = webServer.arg("lockEnabled") == "1";
+  const bool requestedOpenEnabled = webServer.arg("openEnabled") == "1";
+  if ((requestedLockEnabled && lockStartMinute == lockEndMinute) ||
+      (requestedOpenEnabled && openStartMinute == openEndMinute)) {
+    webServer.send(400, "application/json",
+                   "{\"message\":\"An enabled window needs different start and end times.\"}");
+    return;
+  }
+
+  lockedScheduleEnabled = requestedLockEnabled;
+  lockedScheduleStartMinute = lockStartMinute;
+  lockedScheduleEndMinute = lockEndMinute;
+  openScheduleEnabled = requestedOpenEnabled;
+  openScheduleStartMinute = openStartMinute;
+  openScheduleEndMinute = openEndMinute;
   lastScheduleTarget = -1;
-  preferences.putBool("schedOn", scheduleEnabled);
-  preferences.putUShort("openMin", scheduledOpenMinute);
-  preferences.putUShort("lockMin", scheduledLockMinute);
+  preferences.putBool("lockOn", lockedScheduleEnabled);
+  preferences.putUShort("lockStart", lockedScheduleStartMinute);
+  preferences.putUShort("lockEnd", lockedScheduleEndMinute);
+  preferences.putBool("openOn", openScheduleEnabled);
+  preferences.putUShort("openStart", openScheduleStartMinute);
+  preferences.putUShort("openEnd", openScheduleEndMinute);
 
   webServer.send(200, "application/json",
-                 scheduleEnabled
-                   ? "{\"message\":\"Daily schedule saved and enabled.\"}"
-                   : "{\"message\":\"Schedule saved but disabled.\"}");
+                 schedulesAreEnabled()
+                   ? "{\"message\":\"Daily schedules saved.\"}"
+                   : "{\"message\":\"Schedules saved; Automatic mode has no time rules.\"}");
 }
 
 void startWebServer() {
@@ -1193,9 +1239,12 @@ void setup() {
   Serial.println("Integrated smart cat-door controller starting");
 
   preferences.begin("smartdoor", false);
-  scheduleEnabled = preferences.getBool("schedOn", false);
-  scheduledOpenMinute = preferences.getUShort("openMin", 8 * 60);
-  scheduledLockMinute = preferences.getUShort("lockMin", 22 * 60);
+  lockedScheduleEnabled = preferences.getBool("lockOn", false);
+  lockedScheduleStartMinute = preferences.getUShort("lockStart", 22 * 60);
+  lockedScheduleEndMinute = preferences.getUShort("lockEnd", 8 * 60);
+  openScheduleEnabled = preferences.getBool("openOn", false);
+  openScheduleStartMinute = preferences.getUShort("openStart", 8 * 60);
+  openScheduleEndMinute = preferences.getUShort("openEnd", 22 * 60);
   const uint8_t savedMode = preferences.getUChar("savedMode", MODE_AUTOMATIC);
   loadDoorHistory();
   if (savedMode == MODE_FORCE_OPEN || savedMode == MODE_FORCE_LOCKED) {
